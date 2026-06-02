@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -38,18 +38,38 @@ def configure_trainable_parts(model, freeze_text: bool = True, freeze_vision: bo
 
 
 def siglip_pairwise_loss(logits_per_image: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """SigLIP-style pairwise logistic loss.
-
-    Standard image-text contrastive CE assumes only one positive pair per batch.
-    NABirds batches can contain duplicate species, so this loss treats every sample
-    with the same class label as a positive pair.
-    """
     same_class = labels[:, None].eq(labels[None, :])
-    targets = torch.where(same_class, torch.ones_like(logits_per_image), -torch.ones_like(logits_per_image))
+    targets = torch.where(
+        same_class,
+        torch.ones_like(logits_per_image),
+        -torch.ones_like(logits_per_image),
+    )
     return F.softplus(-targets * logits_per_image).mean()
 
 
-def normalize_features(x: torch.Tensor) -> torch.Tensor:
+def _to_feature_tensor(x) -> torch.Tensor:
+    """Make SigLIP feature extraction robust across transformers versions."""
+    if isinstance(x, torch.Tensor):
+        return x
+
+    if hasattr(x, "pooler_output") and x.pooler_output is not None:
+        return x.pooler_output
+
+    if hasattr(x, "last_hidden_state") and x.last_hidden_state is not None:
+        return x.last_hidden_state[:, 0]
+
+    if isinstance(x, (tuple, list)):
+        for item in x:
+            if isinstance(item, torch.Tensor):
+                return item
+            if hasattr(item, "pooler_output") and item.pooler_output is not None:
+                return item.pooler_output
+
+    raise TypeError(f"Could not convert output of type {type(x)} to tensor features.")
+
+
+def normalize_features(x) -> torch.Tensor:
+    x = _to_feature_tensor(x)
     return F.normalize(x, p=2, dim=-1)
 
 
@@ -58,10 +78,12 @@ def get_logit_scale_and_bias(model, device: torch.device):
         scale = model.logit_scale.exp().to(device)
     else:
         scale = torch.tensor(1.0, device=device)
+
     if hasattr(model, "logit_bias"):
         bias = model.logit_bias.to(device)
     else:
         bias = torch.tensor(0.0, device=device)
+
     return scale, bias
 
 
@@ -77,6 +99,7 @@ def encode_class_texts(
     model.eval()
     texts = [class_texts[i] for i in range(len(class_texts))]
     all_features: List[torch.Tensor] = []
+
     for start in range(0, len(texts), batch_size):
         batch_texts = texts[start : start + batch_size]
         encoded = processor(
@@ -87,16 +110,22 @@ def encode_class_texts(
             return_tensors="pt",
         )
         encoded = {k: v.to(device) for k, v in encoded.items()}
+
         features = model.get_text_features(**encoded)
-        all_features.append(normalize_features(features).cpu())
+        features = normalize_features(features)
+        all_features.append(features.cpu())
+
     return torch.cat(all_features, dim=0)
 
 
 @torch.no_grad()
 def image_text_logits(model, pixel_values: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
     device = pixel_values.device
+
     image_features = model.get_image_features(pixel_values=pixel_values)
     image_features = normalize_features(image_features)
+
     text_features = text_features.to(device)
+
     scale, bias = get_logit_scale_and_bias(model, device)
     return image_features @ text_features.T * scale + bias

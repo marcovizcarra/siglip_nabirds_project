@@ -3,12 +3,12 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Tuple
+from typing import Dict, List, Mapping
 
 import pandas as pd
 
 
-TEXT_MODES = ("label", "attributes", "prompt")
+TEXT_MODES = ("label", "attributes", "prompt", "hybrid")
 
 
 def normalize_label(text: str) -> str:
@@ -39,9 +39,6 @@ def parse_attribute_list(value: object) -> List[str]:
 def attributes_to_sentence(attributes: List[str]) -> str:
     if not attributes:
         return ""
-    if len(attributes) == 1:
-        return attributes[0]
-    # Keep it simple and compact for SigLIP's text encoder.
     return ", ".join(attributes)
 
 
@@ -50,6 +47,30 @@ def fallback_prompt_from_attributes(attributes: List[str], class_name: str) -> s
     if attr_text:
         return f"A bird with {attr_text}."
     return class_name
+
+
+def clean_sentence(text: str) -> str:
+    text = " ".join(str(text).strip().split())
+    if not text:
+        return ""
+    if not text.endswith("."):
+        text += "."
+    return text
+
+
+def hybrid_prompt(class_name: str, attrs: List[str], prompt_value: object) -> str:
+    """Combine the discriminative class label with expert visual description."""
+    label_part = f"A photo of a {class_name}."
+
+    if prompt_value is not None and not pd.isna(prompt_value) and str(prompt_value).strip():
+        desc = clean_sentence(str(prompt_value))
+    else:
+        desc = clean_sentence(fallback_prompt_from_attributes(attrs, class_name))
+
+    if desc.lower() == class_name.lower() or desc.lower() == clean_sentence(class_name).lower():
+        return label_part
+
+    return f"{label_part} {desc}"
 
 
 def load_expert_csv(csv_path: str | Path) -> pd.DataFrame:
@@ -72,12 +93,13 @@ def build_class_texts(
     mode: str,
     label_template: str = "{label}",
 ) -> Dict[int, str]:
-    """Build the class-level text input for each NABirds class.
+    """Build class-level text input for each NABirds class.
 
     Modes:
-      - label: only the NABirds class label, e.g. "Least Sandpiper".
-      - attributes: comma-separated short visual attributes from expert_visual_description.
-      - prompt: full prompt sentence from expert_visual_description_text.
+      - label: only the NABirds class label.
+      - attributes: comma-separated short visual attributes.
+      - prompt: expert_visual_description_text only.
+      - hybrid: class label + expert_visual_description_text.
     """
     if mode not in TEXT_MODES:
         raise ValueError(f"Unknown text mode {mode!r}; expected one of {TEXT_MODES}")
@@ -93,20 +115,27 @@ def build_class_texts(
     for idx, class_name in idx_to_class_name.items():
         class_id = idx_to_class_id[idx]
         row = by_id.get(class_id) or by_label.get(normalize_label(class_name))
+
         attrs: List[str] = []
+        prompt_value = None
+
         if row is not None:
             attrs = list(row.get("_attributes", []))
+            prompt_value = row.get("expert_visual_description_text")
 
         if mode == "label":
             text = label_template.format(label=class_name)
         elif mode == "attributes":
             text = attributes_to_sentence(attrs) or class_name
-        else:  # prompt
-            prompt_value = row.get("expert_visual_description_text") if row is not None else None
+        elif mode == "prompt":
             if prompt_value is not None and not pd.isna(prompt_value) and str(prompt_value).strip():
                 text = str(prompt_value).strip()
             else:
                 text = fallback_prompt_from_attributes(attrs, class_name)
+        elif mode == "hybrid":
+            text = hybrid_prompt(class_name, attrs, prompt_value)
+        else:
+            raise ValueError(f"Unknown text mode: {mode}")
 
         class_texts[int(idx)] = " ".join(text.split())
 
@@ -122,6 +151,7 @@ def export_text_table(
 ) -> pd.DataFrame:
     rows = []
     idx_to_class_id = {idx: cid for cid, idx in class_id_to_idx.items()}
+
     for mode in TEXT_MODES:
         class_texts = build_class_texts(
             idx_to_class_name=idx_to_class_name,
@@ -140,6 +170,7 @@ def export_text_table(
                     "text": text,
                 }
             )
+
     out_df = pd.DataFrame(rows).sort_values(["mode", "class_idx"])
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

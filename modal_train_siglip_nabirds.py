@@ -23,6 +23,8 @@ image = (
         "scikit-learn>=1.3.0",
         "wandb>=0.17.0",
         "tqdm>=4.66.0",
+        "sentencepiece>=0.2.0",
+        "protobuf>=4.25.0",
     )
     .add_local_dir("siglip_nabirds", remote_path="/root/siglip_nabirds")
 )
@@ -30,8 +32,8 @@ image = (
 
 @app.function(
     image=image,
-    gpu="A10G",
-    timeout=60 * 60 * 12,
+    gpu="RTX-PRO-6000",
+    timeout=60 * 60 * 24,
     volumes={DATA_ROOT: volume},
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
@@ -107,11 +109,11 @@ def main(
     model_name: str = "google/siglip-base-patch16-224",
     train_text_encoder: bool = False,
 ):
-    modes = ["label", "attributes", "prompt"] if text_mode == "all" else [text_mode]
+    modes = ["label", "attributes", "prompt", "hybrid"] if text_mode == "all" else [text_mode]
     for mode in modes:
-        if mode not in {"label", "attributes", "prompt"}:
-            raise ValueError("text_mode must be one of: all, label, attributes, prompt")
-        train_one.remote(
+        if mode not in {"label", "attributes", "prompt", "hybrid"}:
+            raise ValueError("text_mode must be one of: all, label, attributes, prompt, hybrid")
+        train_one.spawn(
             text_mode=mode,
             epochs=epochs,
             batch_size=batch_size,
